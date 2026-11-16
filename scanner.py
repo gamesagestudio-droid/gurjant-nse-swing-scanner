@@ -86,7 +86,7 @@ def send_telegram(message):
         data={"chat_id": CHAT_ID, "text": message},
         timeout=20
     )
-
+print("TELEGRAM ERROR:", response.text)
     response.raise_for_status()
 
 def main():
