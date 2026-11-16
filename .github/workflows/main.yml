@@ -1,0 +1,13 @@
+name: Gurjant NSE Swing Scanner
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '30 10 * * 1-5'
+
+jobs:
+  scanner:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Scanner Test
+        run: echo "GURJANT NSE SCANNER STARTED SUCCESSFULLY"
