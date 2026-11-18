@@ -1,185 +1,295 @@
 
-
 import os
+import time
+from io import StringIO
+
+import pandas as pd
 import requests
 import yfinance as yf
-import pandas as pd
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")
+# GURJANT NSE SWING SCANNER V2
 
-# NSE Starter Watchlist
-SYMBOLS = [
-    "RELIANCE", "TCS", "INFY", "HDFCBANK", "ICICIBANK",
-    "SBIN", "TATAMOTORS", "ITC", "BEL", "NTPC",
-    "ONGC", "POWERGRID", "IRFC", "RVNL", "NHPC",
-    "TATASTEEL", "SAIL", "BHEL", "PNB", "CANBK"
-]
+NIFTY500_URL = "https://www.niftyindices.com/IndexConstituent/ind_nifty500list.csv"
 
 MAX_PRICE = 1500
-MIN_AVG_VOLUME = 100000
-VOLUME_MULTIPLE = 1.5
+MIN_AVG_VOLUME = 50000
+VOLUME_MULTIPLE = 1.2
+RSI_MIN = 40
+RSI_MAX = 70
+BATCH_SIZE = 40
+TOP_N = 30
+
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+CHAT_ID = os.getenv("CHAT_ID", "").strip()
 
 
-def scan_stock(symbol):
-    ticker = symbol + ".NS"
+def get_symbols():
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Referer": "https://www.niftyindices.com/"
+    }
 
-    try:
-        df = yf.download(
-            ticker,
-            period="6mo",
-            interval="1d",
-            auto_adjust=True,
-            progress=False
+    response = requests.get(
+        NIFTY500_URL,
+        headers=headers,
+        timeout=30
+    )
+    response.raise_for_status()
+
+    table = pd.read_csv(StringIO(response.text))
+
+    if "Symbol" not in table.columns:
+        raise ValueError("NIFTY 500 Symbol column missing")
+
+    symbols = (
+        table["Symbol"]
+        .dropna()
+        .astype(str)
+        .str.strip()
+        .str.upper()
+        .drop_duplicates()
+        .tolist()
+    )
+
+    if len(symbols) < 450:
+        raise ValueError(
+            f"Incomplete stock list: {len(symbols)} symbols"
         )
 
-        if df.empty or len(df) < 50:
-            print(symbol, "Insufficient data")
-            return None
+    return symbols
 
-        close = df["Close"].squeeze()
-        volume = df["Volume"].squeeze()
 
-        price = float(close.iloc[-1])
+def calculate_rsi(series, period=14):
+    delta = series.diff()
 
-        ema20 = float(
-            close.ewm(span=20).mean().iloc[-1]
-        )
+    gain = delta.clip(lower=0).ewm(
+        alpha=1 / period,
+        adjust=False
+    ).mean()
 
-        ema50 = float(
-            close.ewm(span=50).mean().iloc[-1]
-        )
+    loss = (-delta.clip(upper=0)).ewm(
+        alpha=1 / period,
+        adjust=False
+    ).mean()
 
-        # RSI 14
-        delta = close.diff()
+    rs = gain / loss.replace(0, float("nan"))
 
-        gain = delta.clip(lower=0).rolling(14).mean()
-        loss = -delta.clip(upper=0).rolling(14).mean()
+    return (100 - 100 / (1 + rs)).fillna(100)
 
-        rs = gain / loss.replace(0, float("nan"))
 
-        rsi = float(
-            (100 - (100 / (1 + rs))).iloc[-1]
-        )
+def get_series(data, field, ticker):
+    if isinstance(data.columns, pd.MultiIndex):
+        for key in [(field, ticker), (ticker, field)]:
+            if key in data.columns:
+                return data[key].dropna()
 
-        # Volume
-        avg_volume = float(volume.iloc[-21:-1].mean())
-        today_volume = float(volume.iloc[-1])
+        return pd.Series(dtype=float)
 
-        if avg_volume <= 0:
-            return None
+    if field in data.columns:
+        return data[field].dropna()
 
-        volume_ratio = today_volume / avg_volume
+    return pd.Series(dtype=float)
 
-        # Scanner filters
-        if (
-            price <= MAX_PRICE
-            and ema20 > ema50
-            and 45 <= rsi <= 68
-            and avg_volume >= MIN_AVG_VOLUME
-            and volume_ratio >= VOLUME_MULTIPLE
-        ):
-            return {
-                "symbol": symbol,
-                "price": round(price, 2),
-                "rsi": round(rsi, 1),
-                "volume_ratio": round(volume_ratio, 2)
-            }
 
-    except Exception as e:
-        print(symbol, "ERROR:", e)
+def scan_batch(symbols):
+    tickers = [symbol + ".NS" for symbol in symbols]
 
-    return None
+    data = yf.download(
+        tickers=tickers,
+        period="6mo",
+        interval="1d",
+        auto_adjust=True,
+        group_by="column",
+        threads=True,
+        progress=False,
+        timeout=25
+    )
+
+    matches = []
+
+    for symbol, ticker in zip(symbols, tickers):
+        try:
+            close = get_series(
+                data, "Close", ticker
+            ).astype(float)
+
+            volume = get_series(
+                data, "Volume", ticker
+            ).astype(float)
+
+            if len(close) < 60 or len(volume) < 25:
+                continue
+
+            price = float(close.iloc[-1])
+
+            avg_volume = float(
+                volume.iloc[-21:-1].mean()
+            )
+
+            latest_volume = float(volume.iloc[-1])
+
+            if avg_volume <= 0:
+                continue
+
+            volume_ratio = latest_volume / avg_volume
+
+            ema20 = float(
+                close.ewm(span=20, adjust=False)
+                .mean().iloc[-1]
+            )
+
+            ema50 = float(
+                close.ewm(span=50, adjust=False)
+                .mean().iloc[-1]
+            )
+
+            rsi = float(
+                calculate_rsi(close).iloc[-1]
+            )
+
+            if (
+                price <= MAX_PRICE
+                and avg_volume >= MIN_AVG_VOLUME
+                and volume_ratio >= VOLUME_MULTIPLE
+                and ema20 > ema50
+                and RSI_MIN <= rsi <= RSI_MAX
+            ):
+                matches.append({
+                    "symbol": symbol,
+                    "price": price,
+                    "rsi": rsi,
+                    "volume_ratio": volume_ratio
+                })
+
+        except Exception as error:
+            print(symbol, "ERROR:", error)
+
+    return matches
 
 
 def send_telegram(message):
-
     if not BOT_TOKEN or not CHAT_ID:
         print("Telegram secrets missing.")
-        print(message)
-        return
+        return False
 
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    url = (
+        f"https://api.telegram.org/"
+        f"bot{BOT_TOKEN}/sendMessage"
+    )
 
-    try:
-        # Telegram message limit safe handling
-        chunks = [
-            message[i:i + 3500]
-            for i in range(0, len(message), 3500)
-        ]
+    parts = []
 
-        for chunk in chunks:
-            response = requests.post(
-                url,
-                data={
-                    "chat_id": CHAT_ID,
-                    "text": chunk
-                },
-                timeout=20
+    while len(message) > 3900:
+        cut = message.rfind("\n", 0, 3900)
+
+        if cut < 100:
+            cut = 3900
+
+        parts.append(message[:cut])
+        message = message[cut:].lstrip()
+
+    parts.append(message)
+
+    for part in parts:
+        response = requests.post(
+            url,
+            data={
+                "chat_id": CHAT_ID,
+                "text": part
+            },
+            timeout=25
+        )
+
+        try:
+            result = response.json()
+        except Exception:
+            result = {"description": response.text[:250]}
+
+        if not response.ok or not result.get("ok", False):
+            raise RuntimeError(
+                "Telegram error: "
+                + result.get("description", "Unknown error")
             )
 
-            # Debug response
-            print("TELEGRAM STATUS:", response.status_code)
-            print("TELEGRAM RESPONSE:", response.text)
-
-            response.raise_for_status()
-
-            result = response.json()
-
-            if not result.get("ok"):
-                raise RuntimeError(
-                    "Telegram API returned ok=false"
-                )
-
-        print("Telegram message sent successfully.")
-
-    except Exception as e:
-        print("TELEGRAM SEND ERROR:", str(e))
-        raise
+    return True
 
 
 def main():
+    print("Downloading NIFTY 500 stock list...")
 
-    results = []
+    symbols = get_symbols()
 
-    for symbol in SYMBOLS:
-        print("Scanning:", symbol)
+    print("Total stocks:", len(symbols))
 
-        result = scan_stock(symbol)
+    matches = []
 
-        if result:
-            results.append(result)
-            print("MATCH:", result)
+    for start in range(0, len(symbols), BATCH_SIZE):
+        batch = symbols[start:start + BATCH_SIZE]
 
-    results.sort(
+        print(
+            "Scanning batch:",
+            start // BATCH_SIZE + 1
+        )
+
+        found = scan_batch(batch)
+
+        matches.extend(found)
+
+        time.sleep(1)
+
+    matches.sort(
         key=lambda x: x["volume_ratio"],
         reverse=True
     )
 
-    message = "GURJANT NSE SWING SCANNER\n\n"
+    lines = [
+        "GURJANT NSE SWING SCANNER V2",
+        f"NIFTY 500 stocks: {len(symbols)}",
+        f"Price <= Rs {MAX_PRICE}",
+        f"Average Volume >= {MIN_AVG_VOLUME}",
+        f"Volume >= {VOLUME_MULTIPLE}x",
+        "EMA20 > EMA50",
+        f"RSI {RSI_MIN}-{RSI_MAX}",
+        ""
+    ]
 
-    if results:
+    if matches:
+        lines.append(
+            f"Matched stocks: {len(matches)}"
+        )
 
-        for i, stock in enumerate(results[:20], 1):
-
-            message += (
-                f"{i}. {stock['symbol']}\n"
-                f"Price: ₹{stock['price']}\n"
-                f"RSI: {stock['rsi']}\n"
-                f"Volume: {stock['volume_ratio']}x\n\n"
+        for i, stock in enumerate(
+            matches[:TOP_N], 1
+        ):
+            lines.append(
+                f"{i}. {stock['symbol']} | "
+                f"Price Rs {stock['price']:.2f} | "
+                f"RSI {stock['rsi']:.1f} | "
+                f"Volume {stock['volume_ratio']:.2f}x"
             )
 
     else:
-        message += "No stocks matched today's filters."
+        lines.append(
+            "No stocks matched today's filters."
+        )
 
-    message += (
-        "\nWatchlist only - not a buy recommendation."
-    )
+    lines.extend([
+        "",
+        "Watchlist only - not a buy recommendation.",
+        "No automatic orders are placed."
+    ])
+
+    report = "\n".join(lines)
 
     print("\nFINAL SCANNER REPORT:\n")
-    print(message)
+    print(report)
 
-    send_telegram(message)
+    sent = send_telegram(report)
+
+    print(
+        "TELEGRAM STATUS:",
+        "SENT" if sent else "NOT SENT"
+    )
 
 
 if __name__ == "__main__":
